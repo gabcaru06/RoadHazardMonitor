@@ -7,7 +7,6 @@
 ## Obstacle Detection Dependencies
 
 ### Arduino Testing
-- `Wire.h` - built-in (I2C communication for ToF sensor)
 - `VL53L0X` by Pololu - install via Arduino IDE Library Manager
   - Repo: https://github.com/pololu/vl53l0x-arduino
 
