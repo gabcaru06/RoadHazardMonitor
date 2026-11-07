@@ -1,0 +1,134 @@
+from picamera2 import Picamera2
+from ultralytics import YOLO
+from gpiozero import Button
+import time
+import os
+import glob
+import cv2
+
+MODEL_PATH  = "door_and_handles.pt"
+CONF        = 0.40           # how sure it has to be to count as a detection
+SAVE_IMAGES = True
+SAVE_DIR    = "detections"
+
+DOOR_BUTTON_PIN  = 2         # button to look for a DOOR
+STAIR_BUTTON_PIN = 3         # button to look for STAIRS
+
+DOOR_NAMES  = {"door"}
+STAIR_NAMES = {"door handle"}
+
+
+# make a filename that doesn't already exist so I don't overwrite old ones
+def next_save_path(directory, label):
+    os.makedirs(directory, exist_ok=True)
+    existing = glob.glob(os.path.join(directory, f"{label}_*.jpg"))
+    nums = []
+    for f in existing:
+        name = os.path.splitext(os.path.basename(f))[0]
+        suffix = name.replace(f"{label}_", "")
+        if suffix.isdigit():
+            nums.append(int(suffix))
+    n = (max(nums) + 1) if nums else 1
+    return os.path.join(directory, f"{label}_{n:04d}.jpg")
+
+
+# figure out the box's position: left/center/right and how far off-center in pixels
+def get_position(box, frame_width):
+    x1, y1, x2, y2 = box.xyxy[0].tolist()
+    box_center = (x1 + x2) / 2
+
+    # pixels off from the middle of the frame (negative = left, positive = right)
+    offset = box_center - (frame_width / 2)
+
+    if box_center < frame_width / 3:
+        direction = "LEFT"
+    elif box_center > frame_width * 2 / 3:
+        direction = "RIGHT"
+    else:
+        direction = "CENTER"
+
+    return direction, offset
+
+
+def detect(picam2, model, target_names, target_label):
+    frame = picam2.capture_array()
+
+    # the camera gives 4 color channels but YOLO wants 3, so drop the extra one
+    if frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+    else:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    frame_width = frame.shape[1]
+
+    results = model(frame, conf=CONF, verbose=False)
+    r = results[0]
+
+    # keep only the detections we asked for, with confidence and position
+    hits = []
+    for box in r.boxes:
+        name = model.names[int(box.cls[0])]
+        if name.lower() in target_names:
+            conf = float(box.conf[0])
+            direction, offset = get_position(box, frame_width)
+            hits.append((name, conf, direction, offset))
+
+    print(f"\nLooking for: {target_label} ---")
+    if hits:
+        hits.sort(key=lambda x: x[1], reverse=True)   # best guess first
+        best_name, best_conf, best_dir, best_off = hits[0]
+        print(f"  DETECTED: {target_label} to the {best_dir} "
+              f"(best match: {best_name} at {best_conf:.2f} confidence)")
+        print(f"  {best_off:.0f} px off-center")
+        if len(hits) > 1:
+            print(f"  ({len(hits)} total detections)")
+        tag = target_label
+    else:
+        print(f"  NOT FOUND: no {target_label} detected.")
+        tag = f"{target_label}_NOTFOUND"
+
+    if SAVE_IMAGES:
+        annotated = r.plot()
+        out_path = next_save_path(SAVE_DIR, tag)
+        cv2.imwrite(out_path, annotated)
+        print(f"  Saved image: {out_path}")
+
+
+def main():
+    print("Loading model...")
+    model = YOLO(MODEL_PATH)
+    print("Model classes:", model.names)
+
+    print("Starting camera...")
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration()
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)  # give it a sec to adjust the exposure
+
+    door_button = Button(DOOR_BUTTON_PIN)
+    stair_button = Button(STAIR_BUTTON_PIN)
+
+    print("\nReady.")
+    print(f"  Door button  (GPIO {DOOR_BUTTON_PIN})  -> look for a DOOR")
+    print(f"  Stair button (GPIO {STAIR_BUTTON_PIN})  -> look for STAIRS")
+    print("  Ctrl+C to quit")
+
+    try:
+        while True:
+            if door_button.is_pressed:
+                detect(picam2, model, DOOR_NAMES, "DOOR")
+                door_button.wait_for_release()   # one press = one detection
+            elif stair_button.is_pressed:
+                detect(picam2, model, STAIR_NAMES, "STAIRS")
+                stair_button.wait_for_release()
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        picam2.stop()
+        picam2.close()
+
+
+if __name__ == "__main__":
+    main()
