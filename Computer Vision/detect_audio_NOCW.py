@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-Button-triggered object detection for the Pi, with spoken results played
-through a DFPlayer-style serial MP3 module (headphones on the module).
+Buttons (internal pull-ups):
+    GPIO 20 -> DOOR
+    GPIO 21 -> STAIRS
+    GPIO 16 -> ELEVATOR  
 
-Three buttons, one per target object (door / stairs / elevator). Press a
-button -> the Pi grabs a frame and checks ONLY for that object -> it then
-speaks the result by playing a short SEQUENCE of pre-recorded clips off
-the module's SD card:
-    found:    "<object> detected"  +  "<n> percent"  +  "<n> o'clock"
-    not found:"no <object> detected"
 
-Because the module can only play pre-recorded, numbered files, the spoken
-sentence is assembled from building-block clips. See CLIP MAP below for
-exactly which file number must contain which phrase.
+STILL NEED TO IMPLEMENT CROSSWALKS!!!!!!!    
 """
 
 import sys
@@ -28,70 +22,72 @@ from gpiozero import Button
 try:
     import serial
 except ImportError:
-    serial = None   # audio is optional - we warn and keep going without it
+    serial = None   # audio optional - we warn and keep going without it
 
 
-# --- detection settings ---
-# Same weights the batch HEIC script verifies against.
-# Model classes are exactly: "door", "stair", "elevator".
+# Single combined model that detects all three classes: door, stair, elevator.
 MODEL_PATH  = "door_stair_elevator.pt"
-CONF        = 0.65           # matches the threshold used in the batch run
+CONF        = 0.65
 SAVE_IMAGES = True
 SAVE_DIR    = "detections"
 
-DOOR_BUTTON_PIN     = 2      # button to look for a DOOR
-STAIR_BUTTON_PIN    = 3      # button to look for STAIRS
-ELEVATOR_BUTTON_PIN = 4      # button to look for an ELEVATOR  (set to your wiring)
+DOOR_BUTTON_PIN     = 20
+STAIR_BUTTON_PIN    = 21
+ELEVATOR_BUTTON_PIN = 16
 
-# Class names the model actually emits (matched case-insensitively).
+# class names in the model's output that count as each object
 DOOR_NAMES     = {"door"}
-STAIR_NAMES    = {"stair"}
+STAIR_NAMES    = {"stair", "stairs"}
 ELEVATOR_NAMES = {"elevator"}
 
-# --- audio module (DFPlayer-style serial MP3 player) ---
+# audio module (DFPlayer serial MP3 player)
 SERIAL_PORT = "/dev/ttyAMA0"
 BAUD_RATE   = 115200
-VOLUME      = 18             # 0-30 (headphones can be quieter - line level)
+VOLUME      = 18            
 MIN_VOL, MAX_VOL = 0, 30
+CLIP_GAP    = 2.0          # seconds to let one clip finish before the next
 
-# Seconds to wait for one clip to finish before playing the next.
-# Set this a little longer than your LONGEST recorded clip.
-CLIP_GAP = 1.5
 
-# ====================== CLIP MAP (what to record) ======================
-# Record these 11 clips and put them on the SD card as the matching file
-# numbers (e.g. 0001.mp3 ... 0011.mp3, copied in order). Keep each clip
-# shorter than CLIP_GAP. (Confidence is NOT spoken.)
-#
-#   1  "door detected"            7  "ten o'clock"
-#   2  "stairs detected"          8  "eleven o'clock"
-#   3  "elevator detected"        9  "twelve o'clock"
-#   4  "no door detected"        10  "one o'clock"
-#   5  "no stairs detected"      11  "two o'clock"
-#   6  "no elevator detected"
+PLAY_MODE = None
+
+# ====================== SD CARD FILE POSITIONS =========================
+# AT+PLAYNUM plays by 1-based position on the card.
+#  1 Door            7 Detected 12   13 11 o'clock   (unused here)
+#  2 Elevator        8 Detect 1      14 12 o'clock   (unused here)
+#  3 Stairs          9 Detect at 2   15 1 o'clock    (unused here)
+#  4 Crosswalk      10 Not detected  16 2 o'clock    (unused here)
+#  5 Detected 10    11 Low battery   17 never        (unused here)
+#  6 Detected 11    12 10 o'clock
+# "Detected N" / "Detect N" clips are the combined "detected, N o'clock".
 # =======================================================================
-CLIP_DETECTED  = {"DOOR": 1, "STAIRS": 2, "ELEVATOR": 3}
-CLIP_NOT_FOUND = {"DOOR": 4, "STAIRS": 5, "ELEVATOR": 6}
-CLIP_CLOCK     = {10: 7, 11: 8, 12: 9, 1: 10, 2: 11}
+
+CLIP_OBJECT       = {"DOOR": 1, "ELEVATOR": 2, "STAIRS": 3}
+CLIP_DETECTED_AT  = {10: 5, 11: 6, 12: 7, 1: 8, 2: 9}   # "detected, N o'clock"
+CLIP_NOT_DETECTED = 10
+
+#labels for each file position, for the terminal readout
+CLIP_LABEL = {
+    1: "Door.mp3",
+    2: "Elevator.mp3",
+    3: "Stairs.mp3",
+    5: "Detected 10.mp3  (detected, 10 o'clock)",
+    6: "Detected 11.mp3  (detected, 11 o'clock)",
+    7: "Detected 12.mp3  (detected, 12 o'clock)",
+    8: "Detect 1.mp3  (detected, 1 o'clock)",
+    9: "Detect at 2.mp3  (detected, 2 o'clock)",
+    10: "Not detected.mp3",
+}
 
 # Clock positions across the frame, left edge -> right edge.
 CLOCK_HOURS = [10, 11, 12, 1, 2]
 
 
-# ----------------------------------------------------------------------
 # audio module
-# ----------------------------------------------------------------------
 def send(ser, command, wait=0.25):
     ser.reset_input_buffer()
     ser.write((command + "\r\n").encode("ascii"))
     time.sleep(wait)
     return ser.read_all().decode("ascii", errors="ignore").strip()
-
-
-def set_volume(ser, vol):
-    vol = max(MIN_VOL, min(MAX_VOL, vol))
-    send(ser, f"AT+VOL={vol}")
-    return vol
 
 
 def open_audio():
@@ -109,20 +105,22 @@ def open_audio():
 
     time.sleep(0.5)
     if "OK" not in send(ser, "AT").upper():
-        print("No OK from the audio module - running WITHOUT audio. "
-              "Check wiring/power.")
+        print("No OK from the DFPlayer - running WITHOUT audio. Check wiring.")
         ser.close()
         return None
 
-    # No AT+AMP - the headphone jack runs off the DAC, not the amp.
-    # No repeat mode: we want play-once so a clip sequence advances cleanly.
-    set_volume(ser, VOLUME)
-    print(f"Audio module ready. Volume: {VOLUME}/30")
+    send(ser, f"AT+VOL={max(MIN_VOL, min(MAX_VOL, VOLUME))}")
+    if PLAY_MODE is not None:
+        send(ser, f"AT+PLAYMODE={PLAY_MODE}")
+    print(f"DFPlayer ready. Volume: {VOLUME}/30")
     return ser
 
 
 def play_clip(ser, n):
-    if ser is None or n is None:
+    if n is None:
+        return
+    print(f"    > play {n:2d}  {CLIP_LABEL.get(n, f'file {n}')}")
+    if ser is None:
         return
     send(ser, f"AT+PLAYNUM={n}")
     time.sleep(CLIP_GAP)        # let it finish before the next clip
@@ -133,9 +131,7 @@ def play_sequence(ser, numbers):
         play_clip(ser, n)
 
 
-# ----------------------------------------------------------------------
 # detection helpers
-# ----------------------------------------------------------------------
 # make a filename that doesn't already exist so I don't overwrite old ones
 def next_save_path(directory, label):
     os.makedirs(directory, exist_ok=True)
@@ -183,7 +179,7 @@ def detect(picam2, model, ser, target_names, target_label):
             hour = clock_position(box, frame_width)
             hits.append((name, conf, hour))
 
-    print(f"\nLooking for: {target_label} ---")
+    print(f"\n--- {target_label} ---")
 
     if hits:
         hits.sort(key=lambda x: x[1], reverse=True)   # best guess first
@@ -192,15 +188,17 @@ def detect(picam2, model, ser, target_names, target_label):
               f"confidence (best match: {best_name})")
         if len(hits) > 1:
             print(f"  ({len(hits)} total detections)")
-        # spoken: "<object> detected" -> "<n> o'clock"  (confidence not spoken)
         play_sequence(ser, [
-            CLIP_DETECTED[target_label],
-            CLIP_CLOCK[best_hour],
+            CLIP_OBJECT[target_label],
+            CLIP_DETECTED_AT[best_hour],
         ])
         tag = target_label
     else:
-        print(f"  NOT FOUND: no {target_label} detected.")
-        play_clip(ser, CLIP_NOT_FOUND[target_label])
+        print(f"  NOT FOUND: no {target_label.lower()} detected.")
+        play_sequence(ser, [
+            CLIP_OBJECT[target_label],
+            CLIP_NOT_DETECTED,
+        ])
         tag = f"{target_label}_NOTFOUND"
 
     if SAVE_IMAGES:
@@ -223,8 +221,7 @@ def main():
 
     print("Starting camera...")
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration()
-    picam2.configure(config)
+    picam2.configure(picam2.create_preview_configuration())
     picam2.start()
     time.sleep(2)  # give it a sec to adjust the exposure
 
