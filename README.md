@@ -37,10 +37,10 @@
   
 #### ToF Setup
 - ToF Repository:
-- ToF Build and Install:
+- ToF Build and Install: https://github.com/Abstract-Horizon/vl53l5cx_python
   ```bash
-  git clone <INSERT VL53L5CX REPO URL>
-  cd <repo-folder>
+  git clone https://github.com/Abstract-Horizon/vl53l5cx_python.git
+  cd vl53l5cx_python
   pip install .
   ```
 - Confirm Sensor is detected:
