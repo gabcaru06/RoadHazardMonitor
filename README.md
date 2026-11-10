@@ -15,5 +15,38 @@
   ```bash
   pip install pyserial
   ```
+  
+### Raspberry Pi Setup
+- Tools
+  ```bash
+  sudo apt update
+  sudo apt install -y git cmake pkg-config build-essential swig python3-dev python3-pip python3-smbus i2c-tools
+  ```
+  
+#### YDLiDAR Setup
+- YDLiDAR Repository: https://github.com/YDLIDAR/YDLidar-SDK
+- YDLiDAR Build and Install SDK:
+  ```bash
+  git clone https://github.com/YDLIDAR/YDLidar-SDK.git
+  cd YDLidar-SDK
+  mkdir build && cd build
+  cmake ..
+  make
+  sudo make install
+  ```
+  
+#### ToF Setup
+- ToF Repository:
+- ToF Build and Install:
+  ```bash
+  git clone <INSERT VL53L5CX REPO URL>
+  cd <repo-folder>
+  pip install .
+  ```
+- Confirm Sensor is detected:
+  ```bash
+  i2cdetect -y 1
+  ```
+  
 
 ## Computer Vision Dependencies
