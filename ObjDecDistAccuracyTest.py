@@ -3,15 +3,11 @@ import csv
 import threading
 import lgpio
 import ydlidar
-from vl53l5cx.vl53l5cx import VL53L5CX, VL53L5CX_RESOLUTION_8X8
 
 # ---- CONFIG ----
 LIDAR_PORT = "/dev/ttyUSB0"
 LIDAR_BAUD = 921600
 LIDAR_ANGLE_TOLERANCE_DEG = 5
-
-TOF_MAX_VALID_MM = 4000
-TOF_CENTER_COLS = (2, 3, 4, 5)
 
 CHIP_NUM = 15
 TRIG_LINE = 19
@@ -26,7 +22,7 @@ TEST_DURATION_S = 10
 distances_to_test = ["0.2m", "0.5m", "0.8m", "1.0m", "1.5m", "2.0m"]
 
 state_lock = threading.Lock()
-shared_state = {"lidar_mm": None, "tof_mm": None, "ultrasonic_mm": None}
+shared_state = {"lidar_mm": None, "ultrasonic_mm": None}
 stop_event = threading.Event()
 
 
@@ -83,40 +79,6 @@ def lidar_worker():
 
 
 # ---------------------------------------------------------------------------
-def tof_worker():
-    driver = VL53L5CX()
-    if not driver.is_alive():
-        print("ToF sensor not alive")
-        return
-
-    driver.init()
-    driver.set_resolution(VL53L5CX_RESOLUTION_8X8)
-    driver.set_ranging_frequency_hz(15)
-    driver.start_ranging()
-
-    def is_valid(status, distance):
-        return status != 255 and distance < TOF_MAX_VALID_MM
-
-    while not stop_event.is_set():
-        if driver.check_data_ready():
-            ranging_data = driver.get_ranging_data()
-            valid = []
-            for i in range(64):
-                status = ranging_data.target_status[driver.nb_target_per_zone * i]
-                distance = ranging_data.distance_mm[driver.nb_target_per_zone * i]
-                col = i % 8
-                if col in TOF_CENTER_COLS and is_valid(status, distance):
-                    valid.append(distance)
-
-            with state_lock:
-                shared_state["tof_mm"] = sum(valid) / len(valid) if valid else None
-
-        time.sleep(0.01)
-
-    driver.stop_ranging()
-
-
-# ---------------------------------------------------------------------------
 def ultrasonic_worker():
     h = lgpio.gpiochip_open(CHIP_NUM)
     lgpio.gpio_claim_output(h, TRIG_LINE)
@@ -169,11 +131,10 @@ def run_test(target_distance, writer):
     while time.time() - start_time < TEST_DURATION_S:
         with state_lock:
             lidar_mm = shared_state["lidar_mm"]
-            tof_mm = shared_state["tof_mm"]
             us_mm = shared_state["ultrasonic_mm"]
 
         timestamp_ms = int((time.time() - start_time) * 1000)
-        writer.writerow([timestamp_ms, target_distance, lidar_mm, tof_mm, us_mm])
+        writer.writerow([timestamp_ms, target_distance, lidar_mm, us_mm])
 
         time.sleep(SAMPLE_INTERVAL_S)
 
@@ -183,18 +144,17 @@ def run_test(target_distance, writer):
 if __name__ == "__main__":
     threads = [
         threading.Thread(target=lidar_worker, daemon=True),
-        threading.Thread(target=tof_worker, daemon=True),
         threading.Thread(target=ultrasonic_worker, daemon=True),
     ]
     for t in threads:
         t.start()
 
-    time.sleep(2)  # let all sensors finish their startup/init before first test
+    time.sleep(2)  # let sensors finish startup/init before first test
 
     try:
         with open("combined_distance_accuracy.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp_ms", "target_distance", "lidar_mm", "tof_mm", "ultrasonic_mm"])
+            writer.writerow(["timestamp_ms", "target_distance", "lidar_mm", "ultrasonic_mm"])
 
             for dist in distances_to_test:
                 run_test(dist, writer)
