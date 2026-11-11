@@ -3,15 +3,11 @@ import csv
 import threading
 import lgpio
 import ydlidar
-from vl53l5cx.vl53l5cx import VL53L5CX, VL53L5CX_RESOLUTION_8X8
 
 # ---- CONFIG ----
 LIDAR_PORT = "/dev/ttyUSB0"
 LIDAR_BAUD = 921600
 LIDAR_ANGLE_TOLERANCE_DEG = 5
-
-TOF_MAX_VALID_MM = 4000
-TOF_CENTER_COLS = (2, 3, 4, 5)
 
 CHIP_NUM = 15
 TRIG_LINE = 19
@@ -20,17 +16,16 @@ US_TIMEOUT_S = 0.03
 US_SETTLE_DELAY_S = 0.0003
 US_DEBOUNCE_COUNT = 20
 
-HIT_TOLERANCE_MM = 10 # 10 mm, but this is just reliablity testing, not accuracy testing (which we would want wihtin 5 mm when sub 1 meter)
+HIT_TOLERANCE_MM = 5
 
-TEST_DURATION_MIN = 2
+TEST_DURATION_MIN = 30
 SAMPLE_INTERVAL_S = 0.5
 
 state_lock = threading.Lock()
-shared_state = {"lidar_mm": None, "tof_mm": None, "ultrasonic_mm": None}
+shared_state = {"lidar_mm": None, "ultrasonic_mm": None}
 stop_event = threading.Event()
 
 
-# ---------------------------------------------------------------------------
 def lidar_worker():
     ydlidar.os_init()
     laser = ydlidar.CYdLidar()
@@ -82,41 +77,6 @@ def lidar_worker():
     laser.disconnecting()
 
 
-# ---------------------------------------------------------------------------
-def tof_worker():
-    driver = VL53L5CX()
-    if not driver.is_alive():
-        print("ToF sensor not alive")
-        return
-
-    driver.init()
-    driver.set_resolution(VL53L5CX_RESOLUTION_8X8)
-    driver.set_ranging_frequency_hz(15)
-    driver.start_ranging()
-
-    def is_valid(status, distance):
-        return status != 255 and distance < TOF_MAX_VALID_MM
-
-    while not stop_event.is_set():
-        if driver.check_data_ready():
-            ranging_data = driver.get_ranging_data()
-            valid = []
-            for i in range(64):
-                status = ranging_data.target_status[driver.nb_target_per_zone * i]
-                distance = ranging_data.distance_mm[driver.nb_target_per_zone * i]
-                col = i % 8
-                if col in TOF_CENTER_COLS and is_valid(status, distance):
-                    valid.append(distance)
-
-            with state_lock:
-                shared_state["tof_mm"] = min(valid) if valid else None
-
-        time.sleep(0.01)
-
-    driver.stop_ranging()
-
-
-# ---------------------------------------------------------------------------
 def ultrasonic_worker():
     h = lgpio.gpiochip_open(CHIP_NUM)
     lgpio.gpio_claim_output(h, TRIG_LINE)
@@ -158,7 +118,6 @@ def ultrasonic_worker():
     lgpio.gpiochip_close(h)
 
 
-# ---------------------------------------------------------------------------
 def is_hit(distance_mm, known_distance_mm, tolerance_mm):
     if distance_mm is None:
         return False
@@ -172,7 +131,6 @@ if __name__ == "__main__":
 
     threads = [
         threading.Thread(target=lidar_worker, daemon=True),
-        threading.Thread(target=tof_worker, daemon=True),
         threading.Thread(target=ultrasonic_worker, daemon=True),
     ]
     for t in threads:
@@ -184,9 +142,9 @@ if __name__ == "__main__":
     input(f"\nPlace the object at exactly {known_distance_m} m from the sensors, then press Enter to start...")
 
     total_samples = 0
-    hits = {"lidar": 0, "tof": 0, "ultrasonic": 0}
-    current_miss_streak = {"lidar": 0, "tof": 0, "ultrasonic": 0}
-    longest_miss_streak = {"lidar": 0, "tof": 0, "ultrasonic": 0}
+    hits = {"lidar": 0, "ultrasonic": 0}
+    current_miss_streak = {"lidar": 0, "ultrasonic": 0}
+    longest_miss_streak = {"lidar": 0, "ultrasonic": 0}
 
     test_duration_s = TEST_DURATION_MIN * 60
     start_time = time.time()
@@ -196,26 +154,23 @@ if __name__ == "__main__":
     try:
         with open("reliability_test.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp_s", "known_distance_mm", "lidar_mm", "tof_mm", "ultrasonic_mm",
-                              "lidar_hit", "tof_hit", "ultrasonic_hit"])
+            writer.writerow(["timestamp_s", "known_distance_mm", "lidar_mm", "ultrasonic_mm",
+                              "lidar_hit", "ultrasonic_hit"])
 
             while time.time() - start_time < test_duration_s:
                 with state_lock:
                     lidar_mm = shared_state["lidar_mm"]
-                    tof_mm = shared_state["tof_mm"]
                     us_mm = shared_state["ultrasonic_mm"]
 
                 elapsed_s = round(time.time() - start_time, 2)
 
                 lidar_hit = is_hit(lidar_mm, known_distance_mm, HIT_TOLERANCE_MM)
-                tof_hit = is_hit(tof_mm, known_distance_mm, HIT_TOLERANCE_MM)
                 us_hit = is_hit(us_mm, known_distance_mm, HIT_TOLERANCE_MM)
 
-                writer.writerow([elapsed_s, known_distance_mm, lidar_mm, tof_mm, us_mm,
-                                  lidar_hit, tof_hit, us_hit])
+                writer.writerow([elapsed_s, known_distance_mm, lidar_mm, us_mm, lidar_hit, us_hit])
 
                 total_samples += 1
-                for name, hit in (("lidar", lidar_hit), ("tof", tof_hit), ("ultrasonic", us_hit)):
+                for name, hit in (("lidar", lidar_hit), ("ultrasonic", us_hit)):
                     if hit:
                         hits[name] += 1
                         current_miss_streak[name] = 0
@@ -228,7 +183,7 @@ if __name__ == "__main__":
         print("\n=== Reliability Test Results ===")
         print(f"Known distance: {known_distance_mm:.1f} mm (±{HIT_TOLERANCE_MM} mm tolerance)")
         print(f"Total samples: {total_samples}")
-        for name in ("lidar", "tof", "ultrasonic"):
+        for name in ("lidar", "ultrasonic"):
             hit_rate = (hits[name] / total_samples * 100) if total_samples else 0
             longest_miss_s = longest_miss_streak[name] * SAMPLE_INTERVAL_S
             print(f"{name.upper():12s} hit rate: {hit_rate:5.1f}%  |  longest miss streak: "
