@@ -3,17 +3,12 @@ import csv
 import threading
 import lgpio
 import ydlidar
-from vl53l5cx.vl53l5cx import VL53L5CX, VL53L5CX_RESOLUTION_8X8
 
 # ---- CONFIG ----
 LIDAR_PORT = "/dev/ttyUSB0"
 LIDAR_BAUD = 921600
 LIDAR_ANGLE_TOLERANCE_DEG = 5
 LIDAR_THRESHOLD_MM = 1000
-
-TOF_MAX_VALID_MM = 4000
-TOF_CENTER_COLS = (2, 3, 4, 5)
-TOF_THRESHOLD_MM = 1000
 
 CHIP_NUM = 15
 TRIG_LINE = 19
@@ -24,15 +19,14 @@ US_DEBOUNCE_COUNT = 20
 US_THRESHOLD_MM = 1000
 
 NUM_TRIALS = 10
-MAX_WAIT_S = 5.0        # give up waiting for a sensor after this long
-POLL_INTERVAL_S = 0.005 # how often the main loop checks for a crossing
+MAX_WAIT_S = 5.0
+POLL_INTERVAL_S = 0.005
 
 state_lock = threading.Lock()
-shared_state = {"lidar_mm": None, "tof_mm": None, "ultrasonic_mm": None}
+shared_state = {"lidar_mm": None, "ultrasonic_mm": None}
 stop_event = threading.Event()
 
 
-# ---------------------------------------------------------------------------
 def lidar_worker():
     ydlidar.os_init()
     laser = ydlidar.CYdLidar()
@@ -84,41 +78,6 @@ def lidar_worker():
     laser.disconnecting()
 
 
-# ---------------------------------------------------------------------------
-def tof_worker():
-    driver = VL53L5CX()
-    if not driver.is_alive():
-        print("ToF sensor not alive")
-        return
-
-    driver.init()
-    driver.set_resolution(VL53L5CX_RESOLUTION_8X8)
-    driver.set_ranging_frequency_hz(15)
-    driver.start_ranging()
-
-    def is_valid(status, distance):
-        return status != 255 and distance < TOF_MAX_VALID_MM
-
-    while not stop_event.is_set():
-        if driver.check_data_ready():
-            ranging_data = driver.get_ranging_data()
-            valid = []
-            for i in range(64):
-                status = ranging_data.target_status[driver.nb_target_per_zone * i]
-                distance = ranging_data.distance_mm[driver.nb_target_per_zone * i]
-                col = i % 8
-                if col in TOF_CENTER_COLS and is_valid(status, distance):
-                    valid.append(distance)
-
-            with state_lock:
-                shared_state["tof_mm"] = min(valid) if valid else None
-
-        time.sleep(0.005)
-
-    driver.stop_ranging()
-
-
-# ---------------------------------------------------------------------------
 def ultrasonic_worker():
     h = lgpio.gpiochip_open(CHIP_NUM)
     lgpio.gpio_claim_output(h, TRIG_LINE)
@@ -160,7 +119,6 @@ def ultrasonic_worker():
     lgpio.gpiochip_close(h)
 
 
-# ---------------------------------------------------------------------------
 def run_trial(trial_num, writer):
     print(f"\nTrial {trial_num}/{NUM_TRIALS}: get ready to move the object into range.")
     input("Press Enter the instant you start moving the object...")
@@ -168,15 +126,12 @@ def run_trial(trial_num, writer):
     t_start = time.perf_counter()
 
     lidar_latency = None
-    tof_latency = None
     us_latency = None
-
-    lidar_done = tof_done = us_done = False
+    lidar_done = us_done = False
 
     while time.perf_counter() - t_start < MAX_WAIT_S:
         with state_lock:
             lidar_mm = shared_state["lidar_mm"]
-            tof_mm = shared_state["tof_mm"]
             us_mm = shared_state["ultrasonic_mm"]
 
         now = time.perf_counter()
@@ -185,24 +140,19 @@ def run_trial(trial_num, writer):
             lidar_latency = (now - t_start) * 1000
             lidar_done = True
 
-        if not tof_done and tof_mm is not None and tof_mm <= TOF_THRESHOLD_MM:
-            tof_latency = (now - t_start) * 1000
-            tof_done = True
-
         if not us_done and us_mm is not None and us_mm <= US_THRESHOLD_MM:
             us_latency = (now - t_start) * 1000
             us_done = True
 
-        if lidar_done and tof_done and us_done:
+        if lidar_done and us_done:
             break
 
         time.sleep(POLL_INTERVAL_S)
 
     print(f"  LiDAR: {lidar_latency if lidar_latency else 'no detection'} ms")
-    print(f"  ToF: {tof_latency if tof_latency else 'no detection'} ms")
     print(f"  Ultrasonic: {us_latency if us_latency else 'no detection'} ms")
 
-    writer.writerow([trial_num, lidar_latency, tof_latency, us_latency])
+    writer.writerow([trial_num, lidar_latency, us_latency])
 
     print("Move the object back out of range before the next trial.")
     time.sleep(2)
@@ -211,18 +161,17 @@ def run_trial(trial_num, writer):
 if __name__ == "__main__":
     threads = [
         threading.Thread(target=lidar_worker, daemon=True),
-        threading.Thread(target=tof_worker, daemon=True),
         threading.Thread(target=ultrasonic_worker, daemon=True),
     ]
     for t in threads:
         t.start()
 
-    time.sleep(2)  # let sensors finish init
+    time.sleep(2)
 
     try:
         with open("latency_test.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["trial", "lidar_latency_ms", "tof_latency_ms", "ultrasonic_latency_ms"])
+            writer.writerow(["trial", "lidar_latency_ms", "ultrasonic_latency_ms"])
 
             for trial in range(1, NUM_TRIALS + 1):
                 run_trial(trial, writer)
