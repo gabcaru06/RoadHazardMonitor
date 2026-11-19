@@ -3,10 +3,10 @@
 PI PIPELINE + MULTI-SENSOR OBSTACLE DETECTION  (runs on the Raspberry Pi)
 
 OBJECT DETECTION (event-driven, main thread)
-    Three buttons, one per object. Press -> camera frame -> YOLO checks ONLY
+    Four buttons, one per object. Press -> camera frame -> YOLO checks ONLY
     for that object -> result printed AND spoken via the DFPlayer (object clip,
     then "detected, N o'clock" or "not detected").
-    Buttons: GPIO 20 DOOR   21 STAIRS   16 ELEVATOR
+    Buttons: GPIO 20 DOOR   21 STAIRS   16 ELEVATOR   23 CROSSWALK
 
 OBSTACLE DETECTION (continuous, background threads)
     Three sensors each write into a shared state under a lock; a fusion thread
@@ -15,7 +15,8 @@ OBSTACLE DETECTION (continuous, background threads)
       - LiDAR (YDLiDAR GS)        -> all five zones
       - ToF   (VL53L5CX 8x8)      -> mid_left / center / mid_right
       - Ultrasonic (HC-SR04)      -> center (confirmation)
-    Zone LEDs: 17 far-left  23 mid-left  22 center  24 mid-right  27 far-right
+    Zone LEDs: 17 far-left  5 mid-left  22 center  24 mid-right  27 far-right
+    (mid-left moved off GPIO 23 -- see the PIN CONFLICT note below.)
 
 MOTION / IDLE (background thread, MPU-6050 "GY-521" on I2C 0x68)
     After IDLE_TIMEOUT_S with no movement the obstacle side goes to sleep: the
@@ -30,6 +31,14 @@ BATTERY (background thread, ADS1115 16-bit ADC on I2C 0x48)
 
 Object detection uses gpiozero (buttons); the obstacle side uses lgpio (LEDs +
 ultrasonic), exactly as in ObstacleDetection.py. Pins don't overlap.
+
+PIN CONFLICT NOTE (crosswalk button): GPIO 23 was the mid-left zone LED. A pin
+can only be claimed once -- gpiozero would take 23 for the button and
+fusion_worker's lgpio.gpio_claim_output() on the same pin would fail, killing
+the whole obstacle side. The mid-left LED has therefore been moved to GPIO 5
+(free on this build). If you would rather keep the LED on 23, set
+CROSSWALK_BUTTON_PIN to a free pin instead (5, 6, 12 and 26 are all unused)
+and put "mid_left" back to 23 in LED_PINS. Change one or the other, never both.
 
 I2C NOTE: the ToF (0x29), the MPU-6050 (0x68) and the ADS1115 (0x48) all share
 bus 1. Each kernel transfer is atomic, so separate handles are safe, but the
@@ -78,18 +87,22 @@ except ImportError:
 
 
 # ================== OBJECT DETECTION SETTINGS ==================
-MODEL_PATH  = "door_stair_elevator.pt"   # combined model: door, stair, elevator
+# 6-class model: crosswalk, door, door handle, elevator, stair, traffic light.
+# Only the four classes wired to buttons are ever queried.
+MODEL_PATH  = "door_stair_elev_cw.pt"
 CONF        = 0.65
 SAVE_IMAGES = True
 SAVE_DIR    = "detections"
 
-DOOR_BUTTON_PIN     = 20
-STAIR_BUTTON_PIN    = 21
-ELEVATOR_BUTTON_PIN = 16
+DOOR_BUTTON_PIN      = 20
+STAIR_BUTTON_PIN     = 21
+ELEVATOR_BUTTON_PIN  = 16
+CROSSWALK_BUTTON_PIN = 12   # see the PIN CONFLICT note at the top of the file
 
-DOOR_NAMES     = {"door"}
-STAIR_NAMES    = {"stair", "stairs"}
-ELEVATOR_NAMES = {"elevator"}
+DOOR_NAMES      = {"door"}
+STAIR_NAMES     = {"stair", "stairs"}
+ELEVATOR_NAMES  = {"elevator"}
+CROSSWALK_NAMES = {"crosswalk", "cross walk", "crossing"}
 
 # ================== DFPLAYER (AUDIO) SETTINGS ==================
 SERIAL_PORT = "/dev/ttyAMA0"
@@ -103,14 +116,18 @@ CLIP_GAP    = 2.0
 PLAY_MODE   = 3
 PROMPT_TONE = False
 
-CLIP_OBJECT       = {"DOOR": 1, "ELEVATOR": 2, "STAIRS": 3}
+# Clip 4 is the new "Crosswalk" prompt. AT+PLAYNUM indexes files in the order
+# they were copied onto the module, so verify the numbering after adding the
+# file -- if the clips come out shuffled, re-copy them in order or renumber
+# this table to match what actually plays.
+CLIP_OBJECT       = {"DOOR": 1, "ELEVATOR": 2, "STAIRS": 3, "CROSSWALK": 4}
 CLIP_DETECTED_AT  = {10: 5, 11: 6, 12: 7, 1: 8, 2: 9}
 CLIP_NOT_DETECTED = 10
 # Spoken low-battery warning. Record a clip, copy it to the module, and set
 # this to its file number to enable it. None = warn on the console only.
 CLIP_LOW_BATTERY  = None
 CLIP_LABEL = {
-    1: "Door.mp3", 2: "Elevator.mp3", 3: "Stairs.mp3",
+    1: "Door.mp3", 2: "Elevator.mp3", 3: "Stairs.mp3", 4: "Crosswalk.mp3",
     5: "Detected 10.mp3  (detected, 10 o'clock)",
     6: "Detected 11.mp3  (detected, 11 o'clock)",
     7: "Detected 12.mp3  (detected, 12 o'clock)",
@@ -141,10 +158,12 @@ ULTRASONIC_MIN_VALID_M   = 0.04
 # Pi 5 uses 0, older images used 4. Confirm with the `gpiodetect` command.
 # (15 did not exist on this Pi; _open_gpiochip() also falls back automatically.)
 GPIO_CHIP = 0
-# Zone LEDs
+# Zone LEDs. mid_left was GPIO 23; the crosswalk button now owns 23, so the LED
+# moved to GPIO 5. Rewire that one LED or swap the two assignments back -- see
+# the PIN CONFLICT note at the top of the file.
 LED_PINS = {
     "far_left":  17,
-    "mid_left":  23,
+    "mid_left":  5,
     "center":    22,
     "mid_right": 24,
     "far_right": 27,
@@ -959,9 +978,10 @@ def main():
     picam2.start()
     time.sleep(2)
 
-    door_button     = Button(DOOR_BUTTON_PIN)
-    stair_button    = Button(STAIR_BUTTON_PIN)
-    elevator_button = Button(ELEVATOR_BUTTON_PIN)
+    door_button      = Button(DOOR_BUTTON_PIN)
+    stair_button     = Button(STAIR_BUTTON_PIN)
+    elevator_button  = Button(ELEVATOR_BUTTON_PIN)
+    crosswalk_button = Button(CROSSWALK_BUTTON_PIN)
 
     # Keep the device still for this: it calibrates the gyro's resting bias.
     print("Starting motion sensor (hold still)...")
@@ -974,9 +994,10 @@ def main():
     obstacle_threads = start_obstacle_threads()
 
     print("\nReady.")
-    print(f"  Door button     (GPIO {DOOR_BUTTON_PIN})  -> look for a DOOR")
-    print(f"  Stair button    (GPIO {STAIR_BUTTON_PIN})  -> look for STAIRS")
-    print(f"  Elevator button (GPIO {ELEVATOR_BUTTON_PIN})  -> look for an ELEVATOR")
+    print(f"  Door button      (GPIO {DOOR_BUTTON_PIN})  -> look for a DOOR")
+    print(f"  Stair button     (GPIO {STAIR_BUTTON_PIN})  -> look for STAIRS")
+    print(f"  Elevator button  (GPIO {ELEVATOR_BUTTON_PIN})  -> look for an ELEVATOR")
+    print(f"  Crosswalk button (GPIO {CROSSWALK_BUTTON_PIN})  -> look for a CROSSWALK")
     print(f"  Obstacle sensors: {len(obstacle_threads)} thread(s) running")
     print(f"  Motion/idle: {'on' if monitor and IDLE_ENABLED else 'off'}"
           f"   Battery line: GPIO {BATTERY_PIN}")
@@ -991,6 +1012,8 @@ def main():
                 pressed = (STAIR_NAMES, "STAIRS", stair_button)
             elif elevator_button.is_pressed:
                 pressed = (ELEVATOR_NAMES, "ELEVATOR", elevator_button)
+            elif crosswalk_button.is_pressed:
+                pressed = (CROSSWALK_NAMES, "CROSSWALK", crosswalk_button)
 
             if pressed is not None:
                 names, label, button = pressed
